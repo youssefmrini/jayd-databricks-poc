@@ -9,7 +9,19 @@ resources:
     sql_warehouse:
       id: d85fb7ed40320552
       permission: CAN_USE
-  - name: jayd-serving
+  - name: jayd-serving-llama70b
     serving_endpoint:
       name: databricks-meta-llama-3-3-70b-instruct
+      permission: CAN_QUERY
+  - name: jayd-serving-llama405b
+    serving_endpoint:
+      name: databricks-meta-llama-3-1-405b-instruct
+      permission: CAN_QUERY
+  - name: jayd-serving-dbrx
+    serving_endpoint:
+      name: databricks-dbrx-instruct
+      permission: CAN_QUERY
+  - name: jayd-serving-mixtral
+    serving_endpoint:
+      name: databricks-mixtral-8x7b-instruct
       permission: CAN_QUERY
