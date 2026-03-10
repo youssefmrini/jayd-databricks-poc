@@ -6,6 +6,8 @@ from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
 import json
 import uuid
+import os
+import time
 from datetime import datetime
 
 # --- Config ---
@@ -14,11 +16,11 @@ st.set_page_config(page_title="Jayd — Prompt Intelligence", layout="wide", pag
 CATALOG = "main"
 SCHEMA = "jayd_poc"
 MODEL = "databricks-meta-llama-3-3-70b-instruct"
+WAREHOUSE_ID = os.environ.get("DATABRICKS_WAREHOUSE_ID", "d85fb7ed40320552")
 
 # --- Styling ---
 st.markdown("""
 <style>
-    .stApp { background-color: #0e1117; }
     .main-header {
         background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
         padding: 2rem; border-radius: 12px; margin-bottom: 2rem;
@@ -56,46 +58,42 @@ def get_workspace_client():
     return WorkspaceClient()
 
 
-def get_connection():
-    """Get a SQL connection using databricks-sql-connector."""
-    from databricks.sdk import WorkspaceClient
-    import databricks.sql
-
+def execute_sql(statement, params=None):
+    """Execute SQL via the Statement Execution API and return results as a DataFrame."""
     w = get_workspace_client()
-    host = w.config.host.replace("https://", "")
-    token = w.config.authenticate()
-
-    import os
-    warehouse_id = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
-    if not warehouse_id:
-        # Try to find a running warehouse
-        warehouses = list(w.warehouses.list())
-        for wh in warehouses:
-            if wh.state and wh.state.value == "RUNNING":
-                warehouse_id = wh.id
-                break
-        if not warehouse_id and warehouses:
-            warehouse_id = warehouses[0].id
-
-    return databricks.sql.connect(
-        server_hostname=host,
-        http_path=f"/sql/1.0/warehouses/{warehouse_id}",
-        credentials_provider=lambda: {"Authorization": f"Bearer {token}"}
+    response = w.statement_execution.execute_statement(
+        warehouse_id=WAREHOUSE_ID,
+        statement=statement,
+        wait_timeout="50s",
     )
+    if response.status and response.status.state and response.status.state.value == "FAILED":
+        error_msg = response.status.error.message if response.status.error else "Unknown error"
+        raise Exception(f"SQL execution failed: {error_msg}")
+
+    if response.manifest and response.result and response.result.data_array:
+        columns = [col.name for col in response.manifest.schema.columns]
+        return pd.DataFrame(response.result.data_array, columns=columns)
+    return pd.DataFrame()
+
+
+def execute_sql_no_result(statement):
+    """Execute SQL statement that doesn't return results (INSERT, etc.)."""
+    w = get_workspace_client()
+    response = w.statement_execution.execute_statement(
+        warehouse_id=WAREHOUSE_ID,
+        statement=statement,
+        wait_timeout="50s",
+    )
+    if response.status and response.status.state and response.status.state.value == "FAILED":
+        error_msg = response.status.error.message if response.status.error else "Unknown error"
+        raise Exception(f"SQL execution failed: {error_msg}")
 
 
 @st.cache_data(ttl=30)
 def load_silver_data():
     """Load evaluated prompts from silver table."""
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute(f"SELECT * FROM {CATALOG}.{SCHEMA}.silver_evaluated_prompts ORDER BY evaluated_at DESC")
-        columns = [desc[0] for desc in cursor.description]
-        rows = cursor.fetchall()
-        cursor.close()
-        conn.close()
-        df = pd.DataFrame(rows, columns=columns)
+        df = execute_sql(f"SELECT * FROM {CATALOG}.{SCHEMA}.silver_evaluated_prompts ORDER BY evaluated_at DESC")
         return df
     except Exception as e:
         st.error(f"Could not load data: {e}")
@@ -104,6 +102,10 @@ def load_silver_data():
 
 def score_color(score):
     if score is None:
+        return "gray"
+    try:
+        score = float(score)
+    except (ValueError, TypeError):
         return "gray"
     if score >= 70:
         return "#22c55e"
@@ -115,6 +117,10 @@ def score_color(score):
 def score_class(score):
     if score is None:
         return ""
+    try:
+        score = float(score)
+    except (ValueError, TypeError):
+        return ""
     if score >= 70:
         return "score-green"
     elif score >= 40:
@@ -124,6 +130,10 @@ def score_class(score):
 
 def score_badge(score):
     if score is None:
+        return ""
+    try:
+        score = float(score)
+    except (ValueError, TypeError):
         return ""
     if score >= 70:
         return "badge-green"
@@ -154,7 +164,6 @@ def evaluate_prompt(prompt_text: str) -> dict:
         f'Prompt to evaluate: "{prompt_text}"'
     )
     raw = call_llm(system_prompt)
-    # Clean potential markdown fences
     cleaned = raw.strip()
     if cleaned.startswith("```"):
         cleaned = cleaned.split("\n", 1)[-1]
@@ -168,36 +177,29 @@ def insert_prompt_and_evaluation(prompt_text, evaluation):
     """Insert a user-submitted prompt into both tables."""
     prompt_id = f"APP-{uuid.uuid4().hex[:8].upper()}"
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    safe_text = prompt_text.replace("'", "''").replace("\\", "\\\\")
+    safe_suggestion = str(evaluation.get("improvement_suggestion", "")).replace("'", "''").replace("\\", "\\\\")
+    safe_improved = str(evaluation.get("improved_prompt", "")).replace("'", "''").replace("\\", "\\\\")
 
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    # Insert into bronze
-    cursor.execute(f"""
+    execute_sql_no_result(f"""
         INSERT INTO {CATALOG}.{SCHEMA}.bronze_prompts
         (prompt_id, prompt_text, user_id, department, category, submitted_at, source, _ingested_at)
-        VALUES ('{prompt_id}', '{prompt_text.replace("'", "''")}', 'app_user', 'App', 'user_input',
+        VALUES ('{prompt_id}', '{safe_text}', 'app_user', 'App', 'user_input',
                 '{now}', 'app', '{now}')
     """)
 
-    # Insert into silver
-    cursor.execute(f"""
+    execute_sql_no_result(f"""
         INSERT INTO {CATALOG}.{SCHEMA}.silver_evaluated_prompts
         (prompt_id, prompt_text, user_id, department, category, submitted_at, source,
          overall_score, clarity_score, specificity_score, context_score, structure_score,
          improvement_suggestion, improved_prompt, evaluated_at)
-        VALUES ('{prompt_id}', '{prompt_text.replace("'", "''")}', 'app_user', 'App', 'user_input',
+        VALUES ('{prompt_id}', '{safe_text}', 'app_user', 'App', 'user_input',
                 '{now}', 'app',
                 {evaluation.get('overall_score', 0)}, {evaluation.get('clarity_score', 0)},
                 {evaluation.get('specificity_score', 0)}, {evaluation.get('context_score', 0)},
                 {evaluation.get('structure_score', 0)},
-                '{str(evaluation.get("improvement_suggestion", "")).replace("'", "''")}',
-                '{str(evaluation.get("improved_prompt", "")).replace("'", "''")}',
-                '{now}')
+                '{safe_suggestion}', '{safe_improved}', '{now}')
     """)
-
-    cursor.close()
-    conn.close()
 
 
 # --- Header ---
@@ -218,33 +220,24 @@ with tab1:
     st.subheader("Prompt Intelligence Lab")
     st.caption("Enter a prompt to get it scored, improved, and executed against Llama 3.3 70B.")
 
-    # Session state for chat
     if "messages" not in st.session_state:
         st.session_state.messages = []
     if "template_prompt" not in st.session_state:
         st.session_state.template_prompt = None
 
-    # Display chat history
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"], unsafe_allow_html=True)
 
-    # Check for template redirect
-    default_prompt = ""
-    if st.session_state.template_prompt:
-        default_prompt = st.session_state.template_prompt
-        st.session_state.template_prompt = None
-
-    prompt = st.chat_input("Enter your prompt to evaluate...", key="prompt_input")
+    prompt = st.chat_input("Enter your prompt to evaluate...")
 
     if prompt:
-        # Show user message
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            with st.spinner("🔍 Evaluating your prompt..."):
+            with st.spinner("Evaluating your prompt..."):
                 try:
                     evaluation = evaluate_prompt(prompt)
 
@@ -254,7 +247,6 @@ with tab1:
                     context = evaluation.get("context_score", 0)
                     structure = evaluation.get("structure_score", 0)
 
-                    # Score display
                     cols = st.columns(5)
                     for c, (label, val) in zip(cols, [
                         ("Overall", overall), ("Clarity", clarity),
@@ -268,7 +260,6 @@ with tab1:
                         </div>
                         """, unsafe_allow_html=True)
 
-                    # Radar chart
                     fig = go.Figure(data=go.Scatterpolar(
                         r=[clarity, specificity, context, structure, clarity],
                         theta=["Clarity", "Specificity", "Context", "Structure", "Clarity"],
@@ -290,23 +281,20 @@ with tab1:
                     )
                     st.plotly_chart(fig, use_container_width=True)
 
-                    # Improvement suggestion
                     suggestion = evaluation.get("improvement_suggestion", "N/A")
                     improved = evaluation.get("improved_prompt", "N/A")
 
-                    st.markdown("**💡 Improvement Suggestion:**")
+                    st.markdown("**Improvement Suggestion:**")
                     st.info(suggestion)
 
-                    st.markdown("**✨ Improved Prompt:**")
+                    st.markdown("**Improved Prompt:**")
                     st.success(improved)
 
-                    # Save to DB
                     try:
                         insert_prompt_and_evaluation(prompt, evaluation)
                     except Exception:
-                        pass  # Non-blocking
+                        pass
 
-                    # Store for execute button
                     st.session_state["last_improved_prompt"] = improved
 
                     response_md = f"**Score: {overall}/100** | Clarity: {clarity} | Specificity: {specificity} | Context: {context} | Structure: {structure}"
@@ -316,15 +304,14 @@ with tab1:
                     st.error(f"Evaluation error: {e}")
                     st.session_state.messages.append({"role": "assistant", "content": f"Error: {e}"})
 
-    # Execute improved prompt
     if st.session_state.get("last_improved_prompt"):
-        if st.button("🚀 Execute Improved Prompt", type="primary"):
+        if st.button("Execute Improved Prompt", type="primary"):
             improved = st.session_state["last_improved_prompt"]
             with st.chat_message("assistant"):
-                with st.spinner("🤖 Generating response with improved prompt..."):
+                with st.spinner("Generating response with improved prompt..."):
                     try:
                         response = call_llm(improved)
-                        st.markdown("**📝 LLM Response:**")
+                        st.markdown("**LLM Response:**")
                         st.markdown(response)
                         st.session_state.messages.append({"role": "assistant", "content": f"**Response to improved prompt:**\n\n{response}"})
                     except Exception as e:
@@ -340,11 +327,10 @@ with tab2:
     if df.empty:
         st.warning("No evaluated prompts found. Run the pipeline first.")
     else:
-        # Ensure numeric columns
         for col_name in ["overall_score", "clarity_score", "specificity_score", "context_score", "structure_score"]:
-            df[col_name] = pd.to_numeric(df[col_name], errors="coerce")
+            if col_name in df.columns:
+                df[col_name] = pd.to_numeric(df[col_name], errors="coerce")
 
-        # KPI cards
         k1, k2, k3, k4 = st.columns(4)
         total = len(df)
         avg_score = df["overall_score"].mean()
@@ -358,7 +344,6 @@ with tab2:
 
         st.markdown("---")
 
-        # Charts
         c1, c2 = st.columns(2)
 
         with c1:
@@ -390,7 +375,6 @@ with tab2:
             )
             st.plotly_chart(fig_cat, use_container_width=True)
 
-        # Radar by department
         st.markdown("##### Score Dimensions by Department")
         dept_scores = df.groupby("department")[["clarity_score", "specificity_score", "context_score", "structure_score"]].mean()
         fig_radar = go.Figure()
@@ -408,8 +392,7 @@ with tab2:
         )
         st.plotly_chart(fig_radar, use_container_width=True)
 
-        # Bottom 10
-        st.markdown("##### ⚠️ Bottom 10 Prompts (Improvement Opportunities)")
+        st.markdown("##### Bottom 10 Prompts (Improvement Opportunities)")
         bottom = df.nsmallest(10, "overall_score")[["prompt_id", "prompt_text", "department", "category", "overall_score", "improvement_suggestion"]]
         st.dataframe(bottom, use_container_width=True, hide_index=True)
 
@@ -424,15 +407,13 @@ with tab3:
     if df.empty:
         st.warning("No evaluated prompts found.")
     else:
-        for col_name in ["overall_score"]:
-            df[col_name] = pd.to_numeric(df[col_name], errors="coerce")
+        df["overall_score"] = pd.to_numeric(df["overall_score"], errors="coerce")
 
         top = df[df["overall_score"] >= 70].nlargest(20, "overall_score")
 
         if top.empty:
             st.info("No prompts scored above 70 yet.")
         else:
-            # Filters
             categories = ["All"] + sorted(top["category"].dropna().unique().tolist())
             selected_cat = st.selectbox("Filter by category", categories, key="template_cat")
             if selected_cat != "All":
@@ -445,8 +426,8 @@ with tab3:
                     st.markdown(f"""
                     <div class="prompt-card">
                         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;">
-                            <span style="color:#94a3b8; font-size:0.85rem;">{row['category']} · {row['department']}</span>
-                            <span class="badge {badge}">{score}/100</span>
+                            <span style="color:#94a3b8; font-size:0.85rem;">{row['category']} &middot; {row['department']}</span>
+                            <span class="badge {badge}">{int(score)}/100</span>
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
@@ -457,9 +438,9 @@ with tab3:
                         st.text_area("", row["prompt_text"], height=100, key=f"orig_{row['prompt_id']}", disabled=True)
                     with col_b:
                         st.markdown("**Improved:**")
-                        st.text_area("", row.get("improved_prompt", "N/A"), height=100, key=f"imp_{row['prompt_id']}", disabled=True)
+                        st.text_area("", str(row.get("improved_prompt", "N/A")), height=100, key=f"imp_{row['prompt_id']}", disabled=True)
 
-                    if st.button(f"Use Template", key=f"use_{row['prompt_id']}"):
+                    if st.button("Use Template", key=f"use_{row['prompt_id']}"):
                         st.session_state.template_prompt = row.get("improved_prompt", row["prompt_text"])
                         st.toast("Template copied! Switch to Prompt Lab tab to use it.")
 
@@ -476,9 +457,9 @@ with tab4:
         st.warning("No evaluated prompts found.")
     else:
         for col_name in ["overall_score", "clarity_score", "specificity_score", "context_score", "structure_score"]:
-            df[col_name] = pd.to_numeric(df[col_name], errors="coerce")
+            if col_name in df.columns:
+                df[col_name] = pd.to_numeric(df[col_name], errors="coerce")
 
-        # Filters
         f1, f2, f3 = st.columns(3)
         with f1:
             sources = ["All"] + sorted(df["source"].dropna().unique().tolist())
@@ -500,7 +481,6 @@ with tab4:
 
         st.markdown(f"**Showing {len(filtered)} prompts**")
 
-        # Color-coded dataframe
         def color_score(val):
             try:
                 v = float(val)
@@ -514,22 +494,23 @@ with tab4:
 
         display_cols = ["prompt_id", "prompt_text", "department", "category", "source",
                         "overall_score", "clarity_score", "specificity_score", "context_score", "structure_score"]
-        display_df = filtered[display_cols].copy()
+        available_cols = [c for c in display_cols if c in filtered.columns]
+        display_df = filtered[available_cols].copy()
 
         styled = display_df.style.map(
             color_score,
-            subset=["overall_score", "clarity_score", "specificity_score", "context_score", "structure_score"]
+            subset=[c for c in ["overall_score", "clarity_score", "specificity_score", "context_score", "structure_score"] if c in display_df.columns]
         )
         st.dataframe(styled, use_container_width=True, hide_index=True, height=500)
 
-        # Expandable details
         st.markdown("##### Prompt Details")
-        selected_id = st.selectbox("Select a prompt to view details", filtered["prompt_id"].tolist())
-        if selected_id:
-            row = filtered[filtered["prompt_id"] == selected_id].iloc[0]
-            with st.expander(f"Details for {selected_id}", expanded=True):
-                st.markdown(f"**Original Prompt:** {row['prompt_text']}")
-                st.markdown(f"**Overall Score:** {row['overall_score']}")
-                st.markdown(f"**Clarity:** {row['clarity_score']} | **Specificity:** {row['specificity_score']} | **Context:** {row['context_score']} | **Structure:** {row['structure_score']}")
-                st.markdown(f"**Suggestion:** {row.get('improvement_suggestion', 'N/A')}")
-                st.markdown(f"**Improved Prompt:** {row.get('improved_prompt', 'N/A')}")
+        if not filtered.empty:
+            selected_id = st.selectbox("Select a prompt to view details", filtered["prompt_id"].tolist())
+            if selected_id:
+                row = filtered[filtered["prompt_id"] == selected_id].iloc[0]
+                with st.expander(f"Details for {selected_id}", expanded=True):
+                    st.markdown(f"**Original Prompt:** {row['prompt_text']}")
+                    st.markdown(f"**Overall Score:** {row['overall_score']}")
+                    st.markdown(f"**Clarity:** {row['clarity_score']} | **Specificity:** {row['specificity_score']} | **Context:** {row['context_score']} | **Structure:** {row['structure_score']}")
+                    st.markdown(f"**Suggestion:** {row.get('improvement_suggestion', 'N/A')}")
+                    st.markdown(f"**Improved Prompt:** {row.get('improved_prompt', 'N/A')}")
