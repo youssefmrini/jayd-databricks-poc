@@ -1,0 +1,20 @@
+resources:
+  jobs:
+    jayd_pipeline:
+      name: "Jayd POC - Prompt Intelligence Pipeline"
+      tasks:
+        - task_key: setup
+          notebook_task:
+            notebook_path: ../src/notebooks/00_setup.py
+
+        - task_key: autoloader_ingest
+          depends_on:
+            - task_key: setup
+          notebook_task:
+            notebook_path: ../src/notebooks/01_autoloader_ingest.py
+
+        - task_key: llm_evaluation
+          depends_on:
+            - task_key: autoloader_ingest
+          notebook_task:
+            notebook_path: ../src/notebooks/02_llm_evaluation.py

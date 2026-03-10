@@ -1,0 +1,22 @@
+bundle:
+  name: jayd-databricks-poc
+
+variables:
+  catalog:
+    default: main
+  schema:
+    default: jayd_poc
+  warehouse_id:
+    default: ""
+
+include:
+  - resources/*.yml
+
+targets:
+  prod:
+    workspace:
+      host: https://fe-sandbox-yousseftko.cloud.databricks.com
+      profile: fe-sandbox-tko
+    variables:
+      catalog: main
+      schema: jayd_poc
